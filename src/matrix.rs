@@ -1,16 +1,55 @@
-use crate::Vector;
-use anyhow::Result;
+use crate::{dot_product, Vector};
+use anyhow::{Ok, Result};
+use oneshot::channel;
 use std::{
+    fmt,
     fmt::{Debug, Display},
     ops::{Add, AddAssign, Mul},
-    vec,
+    sync::mpsc,
+    thread, vec,
 };
+
+const NUM_PRODUCTERS: usize = 4;
 
 #[allow(dead_code)]
 pub struct Matrix<T> {
     data: Vec<T>,
     row: usize,
     col: usize,
+}
+
+pub struct MsgInput<T> {
+    idx: usize,
+    row: Vector<T>,
+    col: Vector<T>,
+}
+
+pub struct MsgOutput<T> {
+    idx: usize,
+    value: T,
+}
+
+pub struct Msg<T> {
+    input: MsgInput<T>,
+    output: oneshot::Sender<MsgOutput<T>>,
+}
+
+impl<T> Msg<T> {
+    fn new(input: MsgInput<T>, output: oneshot::Sender<MsgOutput<T>>) -> Self {
+        Msg { input, output }
+    }
+}
+
+impl<T> MsgOutput<T> {
+    fn new(idx: usize, value: T) -> Self {
+        MsgOutput { idx, value }
+    }
+}
+
+impl<T> MsgInput<T> {
+    fn new(idx: usize, row: Vector<T>, col: Vector<T>) -> Self {
+        MsgInput { idx, row, col }
+    }
 }
 
 impl<T> Matrix<T> {
@@ -25,9 +64,29 @@ impl<T> Matrix<T> {
 
 pub fn multiply<T>(a: Matrix<T>, b: Matrix<T>) -> Result<Matrix<T>>
 where
-    T: Copy + Default + Add<Output = T> + Mul<Output = T> + AddAssign,
+    T: Copy + Default + Add<Output = T> + Mul<Output = T> + AddAssign + Send + 'static,
 {
     assert_eq!(a.col, b.row);
+    //为每个任务 创建channel、和线程
+    //在线程内创建oneshot channel，在channel send时 将线程内创建的oneshot channel的tx传入到线程中，保存rx接收运算结果
+    let senders = (0..NUM_PRODUCTERS)
+        .map(|_| {
+            let (tx, rx) = mpsc::channel::<Msg<T>>();
+            thread::spawn(move || {
+                for msg in rx {
+                    //接收msg 调用dot_product 使用output send回去
+                    let res = dot_product(msg.input.row, msg.input.col)?;
+                    let output = MsgOutput::new(msg.input.idx, res);
+                    println!("thread {} finished!", &output.idx);
+                    if let Err(err) = msg.output.send(output) {
+                        eprintln!("send error:{}", err);
+                    }
+                }
+                Ok(())
+            });
+            tx
+        })
+        .collect::<Vec<_>>();
     let mut data = vec![T::default(); a.row * b.col];
     for i in 0..a.row {
         for j in 0..b.col {
@@ -40,31 +99,25 @@ where
                 .cloned()
                 .collect::<Vec<_>>();
             let b_part = Vector::new(b_data);
-            data[i * b.col + j] = dot_product(a_part, b_part)?;
+            let (shot_tx, shot_rx) = channel();
+            let msg: Msg<T> = Msg::new(MsgInput::new(i * b.col + j, a_part, b_part), shot_tx);
+            let res = senders[i % NUM_PRODUCTERS].send(msg);
+            if let Err(err) = res {
+                eprintln!("send error:{}", err);
+            } else {
+                let output = shot_rx.recv()?;
+                data[i * b.col + j] = output.value;
+            }
         }
     }
     Ok(Matrix::new(data, a.row, b.col))
-}
-
-pub fn dot_product<T>(a: Vector<T>, b: Vector<T>) -> Result<T>
-where
-    T: Default + Mul<Output = T> + AddAssign + Copy,
-{
-    if a.len() != b.len() {
-        return Err(anyhow::anyhow!("dot product error: a.len()!=b.len()"));
-    }
-    let mut res = T::default();
-    for i in 0..a.len() {
-        res += a[i] * b[i];
-    }
-    Ok(res)
 }
 
 impl<T> Display for Matrix<T>
 where
     T: Display,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         //show [1,2,3,4,5,6] 2,3 as {1 2 3,4 5 6} and show [1,2,3,4,5,6] 3,2 as {1 2,3 4,5 6}
         write!(f, "{{")?;
         for i in 0..self.row {
@@ -79,7 +132,7 @@ where
             }
         }
         write!(f, "}}")?;
-        Ok(())
+        std::fmt::Result::Ok(())
     }
 }
 
@@ -87,7 +140,7 @@ impl<T> Debug for Matrix<T>
 where
     T: Display,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Matrix:rows={},cols={},{}", &self.row, &self.col, &self)
     }
 }
